@@ -1,0 +1,23 @@
+This is a mirror of http://www.vim.org/scripts/script.php?script_id=2468
+
+After installing this plugin, ':Sandbox <sandbox_directory>' on the command line will create a new buffer
+which list the currnet status of the sandbox. In the buffer, a few handy mapping are available like diffing, commit, revert, etc. See the help at  the bottom of the buffer.
+
+Screenshot:
+http://files.myopera.com/wzhliang/albums/649613/sandbox.png
+
+Linux only!
+
+Depends on: svn, meld or tkdiff for GUI diffing.
+ ---------- H E L P -----------
+ c         Commit a single file or selected files.
+ d         Diff the file specified in the current line.
+ e         Open the file in question in a new tab.
+ r         Revert a single file or selected files.
+ t         Select/Unselect a single file.
+ u, U    Update a single file or update all files.
+ v        Resolved a single file or selected files.
+ C-D     Reset selection.
+ <F5>    Refresh the buffer.
+ q       Quit
+
