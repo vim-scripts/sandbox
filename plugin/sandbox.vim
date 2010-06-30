@@ -1,4 +1,4 @@
-" sandbox.vim: Vim script for managing subversion sandbox
+" sandbox.vim: Quick & dirty Vim script for managing subversion sandbox
 " Author: Wenzhi Liang <wenzhi.liang _at_ gmail.com>
 "
 " Licence: This program is free software; you can redistribute it and/or
@@ -28,18 +28,22 @@
 "   though.
 "
 " Requirement:
-" - This is only tested on Linux with svn 1.6. Should work on any platform where
-"   svn command is working though. 
+" - This is only tested on Linux with svn 1.6. However, it should work on any platform where
+"   svn command is working. 
 " - If you're using ssh with your subversion server, you'd have to configure the
 "   ssh-agent yourself.
 " - This script can be used together with vcscommand.vim. It doesn't look
 "   for it though.
 "
 " BUG:
-" - If a file has local modification and 'update' cause it to be modified or
-"   conflict, the status is wrong.
+" - the sandbox location var is shared between all windows.
+" - doesn't work too well with multi-line status
+" - Checking comment is expanded!
+" - There is problem with updating a directory.
 "
 " TODO: 
+" - Add mapping to Shift + Key to temporarily use alternative front end.
+" - Doesn't work if sandbox contain external reference.
 " - tkcvs cannot be run in the background.
 " - There might be some problem with updating a directory.
 " - If a external command spits out loads of messages, the annoying Vim message
@@ -49,23 +53,20 @@
 " - Is it possible to get rid of the "no quotation mark" restriction on commit
 "   message?
 " - Add functionality to add stuff to repo
-" - Add command to hide all files that needs update.
-" - There must be a way to make the command more generic. There are a lot of
-"   duplicated code.
 " - Mass command result in a buffer update. Is there a clever way of removing
 "   this dependency?
 "
 " """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 
-"if exists("sandbox_loaded")
-"    finish
-"else
-"    let sandbox_loaded=1
-"endif
+if exists("sandbox_loaded")
+    finish
+else
+    let sandbox_loaded=1
+endif
 
 " Default configuration {{{
 if !exists("g:sandbox_prefered_gui_diff")
-    let g:sandbox_prefered_gui_diff=['tkdiff', 'meld']
+    let g:sandbox_prefered_gui_diff=['meld', 'diffuse', 'tkdiff']
 endif
 
 if !exists("g:sandbox_use_vcscommand")
@@ -73,28 +74,42 @@ if !exists("g:sandbox_use_vcscommand")
 endif
 
 if !exists("g:sandbox_look_for_updates")
-    let g:sandbox_look_for_updates = 0
+    let g:sandbox_look_for_updates = 1
 endif
 "}}}
 
 " {{{ Local vars
 let s:sandbox_buffer_name = '__sandbox__'
-let b:root_dir=""
+let g:sandbox_root_dir=""
 let b:selected_files=[]
 let s:svn_msg=""
 let b:first_line = 0
 let b:last_line = 0
-let s:supported_gui_diff=['meld', 'tkdiff']
+let s:supported_gui_diff=['meld', 'tkdiff', 'diffuse']
 let s:gui_diff_cmd=""
 let s:gui_log_cmd="tkcvs"
 let s:gui_blame_cmd="tkcvs -blame"
+let b:help_line_number=0
 
 let s:commit_prompt = "Commit message, no quotation marks (leave blank to cancel): "
 let s:revertall_prompt = "Are you sure you want to revert the hilighted files? " 
 let s:anycommand_prompt = "Input the svn command you want to run (without the svn part): "
 
-
 let s:debug = 0
+
+let s:st_dict = { 
+            \ 'A':'Added', 
+            \ 'C':'Conflicted', 
+            \ 'D':'Deleted', 
+            \ 'I':'Ignored', 
+            \ 'M':'Modified', 
+            \ 'R':'Replaced',
+            \ 'S':'Switched', 
+            \ 'X':'Externally defined', 
+            \ '?':'Unknown', 
+            \ '!':'Locally removed', 
+            \ '~':'Obstructed', 
+            \}
 " }}}
 
 " {{{ Check requirment, doesn't return
@@ -108,24 +123,27 @@ if version < 700
     finish
 endif
 
-if !g:sandbox_use_vcscommand
-    for d in g:sandbox_prefered_gui_diff
-        if index( s:supported_gui_diff, d) < 0
-            continue
-        endif
-        if executable( d )
-            "echo "Found gui diffing tool: " . d
-            let s:gui_diff_cmd=d
-            break
-        endif
-    endfor
 
-    if s:gui_diff_cmd == ""
-        echoerr "Dependency error: missing gui diffing tool."
-        finish
+" Detect gui tools anyway 
+for d in g:sandbox_prefered_gui_diff
+    if index( s:supported_gui_diff, d) < 0
+        continue
     endif
+    if executable( d )
+        "echo "Found gui diffing tool: " . d
+        let s:gui_diff_cmd=d
+        break
+    endif
+endfor
+
+if s:gui_diff_cmd == ""
+    echoerr "No external GUI diffing tool found."
+    let g:sandbox_use_vcscommand = 0
+endif
+if !g:sandbox_use_vcscommand
+    echo "Using commands from vcscommand.vim."
 else
-    echo "Using commands from vcscommand.vim"
+    echo "Using commands from vcscommand.vim."
 endif
 "}}}
 
@@ -150,8 +168,7 @@ function! <SID>__IsStatusLine(l)
 endfunc
 
 
-"Prompt the user, return a list, where the first is boolean to signal if
-"following action should be taken, the second is a string 
+"Prompt the user, return a boolean to indicate if following action should be taken or not
 function! <SID>__Prompt(p)
     let ans = input(a:p)
     if ans != ""
@@ -165,7 +182,7 @@ endfunc
 
 "Tag (select) a file for command over multiple files
 function! <SID>TagLine()
-    exe 'lcd ' . b:root_dir
+    exe 'lcd ' . g:sandbox_root_dir
     let num=line('.')
     if ! <SID>__IsStatusLine(num)
         return
@@ -177,10 +194,10 @@ function! <SID>TagLine()
     if l =~ ' (+)$'
         .s/ (+)//g
         let l = getline('.')
-        let fn = <SID>GetFileName(l)
+        let fn = <SID>GetFileNameCheck(l)
         let idx = index( b:selected_files, fn )
     else
-        let fn = <SID>GetFileName(l)
+        let fn = <SID>GetFileNameCheck(l)
         exec "normal  A (+)"
     endif
 
@@ -195,7 +212,7 @@ function! <SID>TagLine()
     normal j
 endfunc
 
-"Reset Selection
+"Reset selection
 function! <SID>UnselectAll()
     let b:selected_files=[]
 
@@ -204,45 +221,58 @@ function! <SID>UnselectAll()
     setlocal nomodifiable
 endfunc
 
+"Jump to the help section in the buffer
+function! <SID>GoToHelp()
+    exe "normal " . b:help_line_number . "G"
+endfunc 
+
 "Get a file name from a line, returns 'XXX' when the line isn't a svn log
 " According to 'svn help st', the first 9 columns are for status and the rest
 " should be revision number and the path " detail, space delimetered.
 function! <SID>GetFileName(l)
-    exe 'lcd ' . b:root_dir
+    exe 'lcd ' . g:sandbox_root_dir
     if g:sandbox_look_for_updates
-        let foo = substitute( a:l, '^.\{9}', '' ,'g')
+        let foo = substitute( a:l, '^.\{21}', '' ,'g')
     else
-        let foo = substitute( a:l, '^.\{8}', '' ,'g')
+        let foo = substitute( a:l, '^.\{20}', '' ,'g')
     endif
-    "call <SID>_Debug(foo)
-    let r = substitute( foo, '^\s\+\d\+\s\+', '', 'g')
-    "call <SID>_Debug( r )
-    if filereadable(r) || isdirectory(r)
-        call <SID>_Debug( r )
-        return r
+    call <SID>_Debug( "foo: " . foo)
+    "let r = substitute( foo, '^\s\+\d\+\s\+', '', 'g')
+    "call <SID>_Debug( "r: " . r )
+    return foo " return blindly as sometimes a file is missing.
+    endif
+endfunc
+
+" Same as above but check the validaty of the file/dir
+function! <SID>GetFileNameCheck(l)
+    let fn=<SID>GetFileName(a:l)
+    if filereadable(fn) || isdirectory(fn)
+        return fn
     else
-        call <SID>_Debug( "XXX" )
         return "XXX"
     endif
 endfunc
 
 "Run svn command on a single file or a list of files
 function! <SID>__ExeSvnCommand(cmd, list, silent)
-    exe 'lcd ' . b:root_dir
+    exe 'lcd ' . g:sandbox_root_dir
     if type(a:list) == 3 "actually a list
         let cli = "svn " . a:cmd . ' ' . join(a:list, ' ')
     else "Assuming it is a string
         let cli = "svn " . ' ' . a:cmd . ' "' . a:list . '"'
+    endif
+    call <SID>_Debug( cli )
+    if s:debug == 1
+        return
     endif
     if a:silent
         silent exec '!' . cli
     else
         exec '!' . cli
     endif
-    echo cli
 endfunc
 
-"Run svn command on a single line
+"Run svn command on sellected files
 function! <SID>__ExeSvnMassCommand(cmd)
     call <SID>__ExeSvnCommand( a:cmd, b:selected_files, 1 )
     call <SID>UpdateBuffer(0)
@@ -257,8 +287,14 @@ function! <SID>__RemoveCurrentLine()
     normal 0DgJ
     setlocal nomodifiable
     let @"=save_reg
+    let b:help_line_number -= 1 
+    let b:last_line -= 1
 endfunc
 
+function! <SID>__MoveToMainWindow()
+    wincmd j
+    exe "lcd " . g:sandbox_root_dir
+endfunc
 
 "Do revert on the current log line
 function! <SID>Revert()
@@ -267,7 +303,7 @@ function! <SID>Revert()
         return
     endif
     let l = getline('.')
-    let fn = <SID>GetFileName(l)
+    let fn = <SID>GetFileNameCheck(l)
     if fn != "XXX"
         let ans = input("Are you sure you want to revert changes made in " . fn . '? ') 
         if toupper(ans) == 'Y' 
@@ -284,7 +320,8 @@ function! <SID>Commit()
         return
     endif
     let l = getline('.')
-    let fn = <SID>GetFileName(l)
+    call <SID>_Debug( l )
+    let fn = <SID>GetFileNameCheck(l)
     if fn != "XXX"
         let ans = input("Commit message, no quotation marks (leave blank to cancel): ") 
         if ans != ""
@@ -304,7 +341,7 @@ function! <SID>Resolved()
     if  l !~ '^C'
         return
     endif
-    let fn = <SID>GetFileName(l)
+    let fn = <SID>GetFileNameCheck(l)
     if fn != "XXX"
         call <SID>__ExeSvnCommand( 'resolved ',  fn, 1 )
         setlocal modifiable
@@ -352,38 +389,46 @@ endfunc
 
 "Update a line
 function! <SID>Update()
-    exe 'lcd ' . b:root_dir
+    exe 'lcd ' . g:sandbox_root_dir
     let num=line('.')
     if ! <SID>__IsStatusLine(num)
         return
     endif
     let l = getline('.')
-    if  l !~ '^.       \*'
-        "echo "Nothing to be done"
+    if  l !~ '^.       \*' && l !~ '^!' 
+        echo "Nothing to be done"
         return
     endif
     let fn = <SID>GetFileName(l)
     if fn != "XXX"
-        call <SID>__ExeSvnCommand( "update --accept 'postpone'",  fn, 1 )
+        echo "updating " . fn
+        call <SID>__ExeSvnCommand( "update -q --accept 'postpone'",  fn, 1 )
         setlocal modifiable
-        echo "updating status for " . fn
-        exe "r!svn st -q " . fn
-        "normal k
-        "call  <SID>__RemoveCurrentLine()
-        "if l =~ '^C'
-        "    :.s/^.      \*/C       /g
-        "else
-        "    :.s/^.      \*/U       /g
-        "endif
+        let svnst = system("svn st -q " . fn )
+        if strlen(svnst) == 0
+            call  <SID>__RemoveCurrentLine()
+        else
+            call setline('.', svnst )
+        endif
         setlocal nomodifiable
+    else
+        echo "Wrong file name. "
     endif
 endfunc
 
-function! <SID>UpdateAll()
-    if b:first_line == 0
+function! <SID>UpdateTagged()
+    if len( b:selected_files ) == 0
+        call <SID>Update()
         return
     endif
-    exec b:first_line . ',' b:last_line . "call <SID>Update()"
+    call <SID>__ExeSvnMassCommand("update -q --accept 'postpone'")
+endfunc
+
+
+function! <SID>UpdateAll()
+    exe 'lcd ' . g:sandbox_root_dir
+    echo "Update whole sandbox..."
+    call <SID>__ExeSvnCommand( "update -q --accept 'postpone'", ".", 1 )
     call <SID>UpdateBuffer(0)
 endfunc
 
@@ -409,7 +454,9 @@ endfunc
 
 "Get log fot current line
 function! <SID>VCSLog(fn)
-    silent exe 'tabe +VCSLog ' . a:fn 
+    call <SID>__MoveToMainWindow()
+    exe "e " . a:fn
+    VCSLog
 endfunc
 " }}}
 
@@ -420,7 +467,9 @@ endfunc
 
 "Get log fot current line
 function! <SID>VCSBlame(fn)
-    silent exe 'tabe +VCSBlame ' . a:fn 
+    call <SID>__MoveToMainWindow()
+    exe "e " . a:fn
+    VCSBlame
 endfunc
 " }}}
 "
@@ -433,12 +482,14 @@ endfunc
 "Diff single file on current line
 "Has to be called by Diff()
 function! <SID>VCS_Diff(f)
-    silent exe 'tabe +VCSVimDiff ' . a:f
+    call <SID>__MoveToMainWindow()
+    exe "e " . a:f
+    VCSVimDiff
 endfunc
 "}}}
 
 
-"We don't support diffing multiple files.... yet
+"We don't support diffing multiple files.
 function! <SID>ErrDiffRange() range
     echoerr "Diff operation is not available on range" 
 endfunc
@@ -460,7 +511,7 @@ function! <SID>ExternalTools(cmd)
         return
     endif
     let l = getline('.')
-    let fn = <SID>GetFileName(l)
+    let fn = <SID>GetFileNameCheck(l)
     if fn == "XXX"
         return
     endif
@@ -477,19 +528,37 @@ function! <SID>ExternalTools(cmd)
     redraw
 endfunc
 
-" Load the file into a new tab
+" Load the file into window below
 function! <SID>Edit()
     let num=line('.')
     if ! <SID>__IsStatusLine(num)
         return
     endif
-    exe 'lcd ' . b:root_dir
+    exe 'lcd ' . g:sandbox_root_dir
     let l = getline('.')
-    let fn = <SID>GetFileName(l)
+    let fn = <SID>GetFileNameCheck(l)
     if fn != "XXX"
-        silent exe "tabe " . fn
+        call <SID>__MoveToMainWindow()
+        silent exe "e " . fn
     endif
 endfunc
+
+
+"Show tooltip about the status of the current file    
+function! <SID>ShowStatusTip()
+    let num=line('.')
+    if ! <SID>__IsStatusLine(num)
+        return
+    endif
+    let num=0 "TODO: support more column
+    let ch=getline('.')[num]
+    try
+        echo s:st_dict[ch]
+    catch /.*/
+        echo "Unknown problem" ch
+    endtry
+endfunc
+
 
 " Run arbitrary svn command from the user
 function! <SID>AnyCommand()
@@ -501,9 +570,9 @@ function! <SID>AnyCommand()
     if ! <SID>__IsStatusLine(num)
         return
     endif
-    exe 'lcd ' . b:root_dir
+    exe 'lcd ' . g:sandbox_root_dir
     let l = getline('.')
-    let fn = <SID>GetFileName(l)
+    let fn = <SID>GetFileNameCheck(l)
     if fn != "XXX"
         let cont=<SID>__Prompt( s:anycommand_prompt )
         if cont 
@@ -513,9 +582,9 @@ function! <SID>AnyCommand()
 endfunc
 
 function! <SID>PrintHelp()
-    "Should only be called within CreateBuffer(). Tries very hard not to map to basic key stroke like lkjh.
     setlocal modifiable
     normal Go
+    let b:help_line_number=line('.')
     call setline('.', " ---------- H E L P -----------" )
     normal o
     call setline('.', " c       Commit a single file or selected files.")
@@ -524,7 +593,7 @@ function! <SID>PrintHelp()
     normal o
     call setline('.', " e       Open the file in question in a new tab.")
     normal o
-    call setline('.', " g       Open a log tree browser.")
+    call setline('.', " o       Open a log tree browser.")
     normal o
     call setline('.', " m       Run blame command on the current file.")
     normal o
@@ -540,7 +609,11 @@ function! <SID>PrintHelp()
     normal o
     call setline('.', " <F5>    Refresh the buffer.")
     normal o
+    call setline('.', " <F6>    Switch between external GUI or VCS plugin.")
+    normal o
     call setline('.', " q       Quit")
+    normal o
+    call setline('.', " ?       Jump to HELP.")
     setlocal nomodifiable
 endfunc
 
@@ -549,7 +622,7 @@ function! <SID>UpdateBuffer(first)
     if !a:first
         echo "Refreshing svn result....."
     endif
-    exe "lcd  " . b:root_dir
+    exe "lcd  " . g:sandbox_root_dir
     mapclear <buffer>
     setlocal modifiable
     normal ggdG
@@ -567,7 +640,7 @@ function! <SID>UpdateBuffer(first)
         let b:last_line -= 1
     endif
     normal gg
-    call setline('.', 'Current sandbox: ' . b:root_dir)
+    call setline('.', 'Current sandbox: ' . g:sandbox_root_dir)
 
     call <SID>PrintHelp()
     normal ggj
@@ -583,17 +656,19 @@ function! <SID>__SetupMapping()
     nnoremap <buffer> <silent> d :call <SID>Diff()<CR>
     vnoremap <buffer> <silent> d :call <SID>ErrDiffRange()<CR>
     nnoremap <buffer> <silent> c :call <SID>CommitAll()<CR>
-    nnoremap <buffer> <silent> g :call <SID>Log()<CR>
+    nnoremap <buffer> <silent> o :call <SID>Log()<CR>
     nnoremap <buffer> <silent> m :call <SID>Blame()<CR>
     nnoremap <buffer> <silent> t :call <SID>TagLine()<CR>
-    nnoremap <buffer> <silent> u :call <SID>Update()<CR>
+    nnoremap <buffer> <silent> u :call <SID>UpdateTagged()<CR>
     nnoremap <buffer> <silent> U :call <SID>UpdateAll()<CR>
     nnoremap <buffer> <silent> v :call <SID>ResolvedAll()<CR>
     nnoremap <buffer> <silent> x :call <SID>AnyCommand()<CR>
     nnoremap <buffer> <silent> e :call <SID>Edit()<CR>
     nnoremap <buffer> <silent> <F5> :call <SID>UpdateBuffer(0)<CR>
+    nnoremap <buffer> <silent> <F6> :call <SID>SwitchFrontEnd()<CR>
     nnoremap <buffer> <silent> <C-D> :call <SID>UnselectAll()<CR>
     nnoremap <buffer> <silent> q :bwipeout!<CR>
+    nnoremap <buffer> <silent> ? :call <SID>GoToHelp()<CR>
     nnoremap <buffer> <silent> <Leader>g :call <SID>Manifest()<CR>
 endfunc
 
@@ -605,16 +680,19 @@ function! <SID>CreateBuffer(p)
     endif
     echo "Getting list of changes for " . a:p . "..."
     exec "silent 18split " . s:sandbox_buffer_name . a:p
-    let b:root_dir = a:p
+    let g:sandbox_root_dir = a:p
     "exe "lcd  " . a:p
     " TODO: The following command should be an more elegant solution than
     " entering directory each time a function is called. However, it doesn't
     " work....
-    "exec "au BufEnter <buffer> lcd " . b:root_dir
+    "exec "au BufEnter <buffer> lcd " . b:sandbox_root_dir
+    au CursorHold <buffer> :call <SID>ShowStatusTip()
 
     setlocal buftype=nofile
     "47 is '/'
     setlocal isk+=47-57,_,a-z,A-Z
+    setlocal nowrap
+    setlocal textwidth=999
     syn clear
     syn match SvnDiffModified "^M\>"
     syn match SvnDiffConflict "^C\>"
@@ -627,12 +705,24 @@ function! <SID>CreateBuffer(p)
     call <SID>UpdateBuffer(1)
 endfunc
 
+" switch between gui or VCS plugin front end
+function! <SID>SwitchFrontEnd()
+    if g:sandbox_use_vcscommand
+        let g:sandbox_use_vcscommand = 0
+        echo "Switching to use external GUI tools."
+    else
+        let g:sandbox_use_vcscommand = 1
+        echo "Switching to use VCS plugin."
+    endif
+endfunc
+
 function! <SID>Manifest()
-    echo "root: " b:root_dir
+    echo "root: " g:sandbox_root_dir
     echo "selected: " b:selected_files
     echo "first_line: " b:first_line
     echo "last_line: " b:last_line
     echo "gui_diff_cmd: " s:gui_diff_cmd
+    echo "help_line_number: " b:help_line_number
 endfunc
 
 """""""""""""""""""""""""""""""""
@@ -649,24 +739,30 @@ Files:
 plugin/sandbox.vim
 
 ChangLog: {{{
-Mon May 11  Re-write GetFileName() function to work with svn 1.6.  Added support for vcscommand.vim.  Added two more GUI commands.
-Thu Jan 29  Support multiple sandboxes.
-Fri Jan 16  Redraw screen after GUI diff
-Tue Dec  2  Added mapping for arbitary svn command execution.
-Thu Nov 27  Renamed to sandbox.vim
-Wed Nov 26  Fixed issue with clean snapshot
-Tue Nov 18  Allow user to specify prefered gui diffing tool. 
+Thu Jun 24 2010 Fixed tagging on very long line problem; added UpdateTagged
+Fri May 14 2010 Fixed update functionality
+Thu May 13 2010 Added mapping for ?
+Wed May 12 2010 Don't use tabe for commands. Added <F6> for switching front end.
+Mon Aug 24 2010 Minor improvement with the _Debug thing.
+Wed Jul  1 2010 Tip in status line to explain 'svn st' abbreviation. Only for the first column.
+Mon May 11 2010 Re-write GetFileNameCheck() function to work with svn 1.6.  Added support for vcscommand.vim.  Added two more GUI commands.
+Thu Jan 29 2009 Support multiple sandboxes.
+Fri Jan 16 2009 Redraw screen after GUI diff
+Tue Dec  2 2009 Added mapping for arbitary svn command execution.
+Thu Nov 27 2009 Renamed to sandbox.vim
+Wed Nov 26 2009 Fixed issue with clean snapshot
+Tue Nov 18 2009 Allow user to specify prefered gui diffing tool. 
             Changed default map. No confusing capitalized mapping anymore, except for U.
-Fri Nov 14  Fixed update. Change mapping <C-R> to <F5> because it clash with things like C-RC-f
-Thu Nov 13  svn output sorted.
-Wed Nov 12  Sandbox path printed at first line. Restricted command to be within actual svn output
-Tue Nov 11  Overhaul or mass command. Mapping redefined.
-Wed Sep 24  Changed implementation of GetFileName() so that it blindly looks for string[21:]
-Wed Sep 10  Added <C-R> for refreshing the buffer
-Wed Aug 20  Added support for 'A'. Added Edit command
-Sat Jul 19  Fully working version.
-Thu Jul 17  Removing reverted or commited line works.
-Tue Jul 15  First working version without range support and hardcoded
+Fri Nov 14 2009 Fixed update. Change mapping <C-R> to <F5> because it clash with things like C-RC-f
+Thu Nov 13 2009 svn output sorted.
+Wed Nov 12 2009 Sandbox path printed at first line. Restricted command to be within actual svn output
+Tue Nov 11 2009 Overhaul or mass command. Mapping redefined.
+Wed Sep 24 2009 Changed implementation of GetFileName() so that it blindly looks for string[21:]
+Wed Sep 10 2009 Added <C-R> for refreshing the buffer
+Wed Aug 20 2009 Added support for 'A'. Added Edit command
+Sat Jul 19 2009 Fully working version.
+Thu Jul 17 2009 Removing reverted or commited line works.
+Tue Jul 15 2009 First working version without range support and hardcoded
             startup directory.
           }}}
 
